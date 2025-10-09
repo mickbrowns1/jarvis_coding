@@ -192,72 +192,63 @@ processors:
         value: "okta"
         action: insert
 
-
 exporters:
-  dataset/logs:
-    dataset_url: "https://xdr.us1.sentinelone.net"
-    api_key: "${MY_API_KEY}"
-    buffer:
-      max_lifetime: 5s
-      retry_shutdown_timeout: 30s
-    server_host:
-      use_hostname: true
-    logs:
-      export_resource_info_on_event: false
+  otlp:
+    endpoint: "104.197.40.197:8016"
 
 service:
   pipelines:
     logs/filelog/meraki:
       receivers: [filelog/meraki]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_meraki]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/f5:
       receivers: [filelog/f5]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_f5]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/fortigate:
       receivers: [filelog/fortigate]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_fortigate]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/netskope:
       receivers: [filelog/netskope]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_netskope]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/palo:
       receivers: [filelog/palo]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_palo]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/mimecast:
       receivers: [filelog/mimecast]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_mimecast]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/zscaler:
       receivers: [filelog/zscaler]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_zscaler]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/proofpoint:
       receivers: [filelog/proofpoint]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_proofpoint]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/googlews:
       receivers: [filelog/googlews]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_googlews]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/wel:
       receivers: [filelog/wel]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_wel]
-      exporters: [dataset/logs]
+      exporters: [otlp]
 
     logs/filelog/okta:
       receivers: [filelog/okta]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_okta]
-      exporters: [dataset/logs]
+      exporters: [otlp]
