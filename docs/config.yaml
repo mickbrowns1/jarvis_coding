@@ -70,6 +70,46 @@ receivers:
       dataSource.name: "zscaler"
       dataSource.vendor: "zscaler"
 
+  filelog/proofpoint:
+    include: [/tmp/jarvislogs/proofpoint/*.log]
+    start_at: beginning
+    operators:
+    include_file_name: true
+    poll_interval: 1s
+    attributes:
+      dataSource.name: "Proofpoint"
+      dataSource.vendor: "Proofpoint"
+
+  filelog/googlews:
+    include: [/tmp/jarvislogs/google/*.log]
+    start_at: beginning
+    operators:
+    include_file_name: true
+    poll_interval: 1s
+    attributes:
+      dataSource.name: "Google WorkSpace"
+      dataSource.vendor: "Google"
+
+  filelog/wel:
+    include: [/tmp/jarvislogs/wel/*.log]
+    start_at: beginning
+    operators:
+    include_file_name: true
+    poll_interval: 1s
+    attributes:
+      dataSource.name: "Windows Event Logs"
+      dataSource.vendor: "Microsoft"
+
+  filelog/okta:
+    include: [/tmp/jarvislogs/okta/*.log]
+    start_at: beginning
+    operators:
+    include_file_name: true
+    poll_interval: 1s
+    attributes:
+      dataSource.name: "Okta"
+      dataSource.vendor: "Okta"
+
 processors:
   # Batches logs for efficient export
   batch:
@@ -128,6 +168,31 @@ processors:
         value: "zscaler"
         action: insert
 
+  attributes/add_metadata_proofpoint:
+    actions:
+      - key: parser
+        value: "proofpoint"
+        action: insert
+
+  attributes/add_metadata_googlews:
+    actions:
+      - key: parser
+        value: "googlews"
+        action: insert
+
+  attributes/add_metadata_wel:
+    actions:
+      - key: parser
+        value: "windowseventlogs"
+        action: insert
+
+  attributes/add_metadata_okta:
+    actions:
+      - key: parser
+        value: "okta"
+        action: insert
+
+
 exporters:
   dataset/logs:
     dataset_url: "https://xdr.us1.sentinelone.net"
@@ -175,4 +240,24 @@ service:
     logs/filelog/zscaler:
       receivers: [filelog/zscaler]
       processors: [batch,attributes/add_metadata,attributes/add_metadata_zscaler]
+      exporters: [dataset/logs]
+
+    logs/filelog/proofpoint:
+      receivers: [filelog/proofpoint]
+      processors: [batch,attributes/add_metadata,attributes/add_metadata_proofpoint]
+      exporters: [dataset/logs]
+
+    logs/filelog/googlews:
+      receivers: [filelog/googlews]
+      processors: [batch,attributes/add_metadata,attributes/add_metadata_googlews]
+      exporters: [dataset/logs]
+
+    logs/filelog/wel:
+      receivers: [filelog/wel]
+      processors: [batch,attributes/add_metadata,attributes/add_metadata_wel]
+      exporters: [dataset/logs]
+
+    logs/filelog/okta:
+      receivers: [filelog/okta]
+      processors: [batch,attributes/add_metadata,attributes/add_metadata_okta]
       exporters: [dataset/logs]
