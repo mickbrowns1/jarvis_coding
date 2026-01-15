@@ -1,6 +1,7 @@
 import os
 import subprocess
 import json
+import csv
 import socket
 import requests
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
@@ -25,6 +26,11 @@ BACKEND_API_KEY = os.environ.get('BACKEND_API_KEY')
 @app.route('/')
 def index():
     return render_template('log_generator.html')
+
+@app.route('/test-token-storage')
+def test_token_storage():
+    """Token storage test page"""
+    return render_template('test_token_storage.html')
 
 def get_scripts():
     scripts = {}
@@ -56,8 +62,23 @@ def fetch_generators():
     try:
         headers = {'X-API-Key': BACKEND_API_KEY} if BACKEND_API_KEY else None
         all_items = []
-        # First try to request a large page to avoid pagination
-        resp = requests.get(base_url, params={'page': 1, 'per_page': 500}, headers=headers, timeout=20)
+        
+        # Retry logic for API startup
+        max_retries = 5
+        retry_delay = 2
+        for attempt in range(max_retries):
+            try:
+                # First try to request a large page to avoid pagination
+                resp = requests.get(base_url, params={'page': 1, 'per_page': 500}, headers=headers, timeout=10)
+                break  # Success, exit retry loop
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"API not ready (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5  # Exponential backoff
+                else:
+                    raise  # Re-raise on final attempt
+        
         if resp.status_code == 200:
             payload = resp.json()
             data = payload.get('data', {})
@@ -148,23 +169,45 @@ def create_destination():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/destinations/<dest_id>', methods=['DELETE'])
-def delete_destination(dest_id: str):
-    """Delete destination via backend API"""
+def delete_destination(dest_id):
+    """Delete a destination"""
     try:
-        resp = requests.delete(
+        response = requests.delete(
             f"{API_BASE_URL}/api/v1/destinations/{dest_id}",
             headers=_get_api_headers(),
             timeout=10
         )
-        
-        if resp.status_code == 204:
-            return ('', 204)
-        else:
-            error_detail = resp.json().get('detail', resp.text) if resp.headers.get('content-type') == 'application/json' else resp.text
-            logger.error(f"Backend returned {resp.status_code}: {error_detail}")
-            return jsonify({'error': error_detail}), resp.status_code
+        return Response(status=response.status_code)
     except Exception as e:
         logger.error(f"Failed to delete destination: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/destinations/<dest_id>/update-token', methods=['POST'])
+def update_destination_token(dest_id):
+    """Update token for a destination in the database"""
+    try:
+        data = request.json
+        token = data.get('token')
+        
+        if not token:
+            return jsonify({'error': 'Token is required'}), 400
+        
+        # Update the destination with new token
+        response = requests.put(
+            f"{API_BASE_URL}/api/v1/destinations/{dest_id}",
+            headers=_get_api_headers(),
+            json={'token': token},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"Updated token for destination: {dest_id}")
+            return jsonify({'message': 'Token updated successfully'})
+        else:
+            return jsonify({'error': f'Backend returned {response.status_code}'}), response.status_code
+            
+    except Exception as e:
+        logger.error(f"Failed to update destination token: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/scenarios', methods=['GET'])
@@ -245,6 +288,22 @@ def list_scenarios():
             'phases': ['Access', 'Movement']
         },
         {
+            'id': 'finance_mfa_fatigue_scenario',
+            'name': 'Finance Employee MFA Fatigue Attack',
+            'description': 'Baseline (Days 1-7), MFA fatigue from Russia, OneDrive exfiltration, SOAR detections and automated response.',
+            'duration_days': 8,
+            'total_events': 135,
+            'phases': ['Normal Behavior', 'MFA Fatigue', 'Initial Access', 'Data Exfiltration', 'Detection & Response']
+        },
+        {
+            'id': 'insider_cloud_download_exfiltration',
+            'name': 'Insider Data Exfiltration via Cloud Download',
+            'description': 'Insider threat scenario: anomalous large-volume M365/SharePoint downloads (180+ files), DLP classification, and removable USB media copying. Correlates Okta, M365 UAL, DLP, and EDR.',
+            'duration_days': 8,
+            'total_events': 280,
+            'phases': ['Baseline', 'Off-Hours Access', 'Cloud Download Spike', 'USB Copy', 'Detection']
+        },
+        {
             'id': 'scenario_hec_sender',
             'name': 'Scenario HEC Sender',
             'description': 'Generic scenario sender that replays a scenario JSON to HEC.',
@@ -270,6 +329,12 @@ def run_scenario():
     scenario_id = data.get('scenario_id')
     destination_id = data.get('destination_id')
     worker_count = int(data.get('workers', 10))  # Default 10 parallel workers
+    tag_phase = data.get('tag_phase', True)
+    tag_trace = data.get('tag_trace', True)
+    trace_id = (data.get('trace_id') or '').strip()
+    generate_noise = data.get('generate_noise', False)
+    noise_events_count = int(data.get('noise_events_count', 1200))
+    local_token = data.get('hec_token')  # Token from browser localStorage
     
     if not scenario_id:
         return jsonify({'error': 'scenario_id is required'}), 400
@@ -293,16 +358,22 @@ def run_scenario():
         
         hec_url = chosen.get('url')
         
-        # Fetch decrypted token from backend
-        token_resp = requests.get(
-            f"{API_BASE_URL}/api/v1/destinations/{destination_id}/token",
-            headers=_get_api_headers(),
-            timeout=10
-        )
-        if token_resp.status_code != 200:
-            return jsonify({'error': 'Failed to retrieve HEC token'}), 400
-        
-        hec_token = token_resp.json().get('token')
+        # Use local token if provided, otherwise fetch from backend
+        if local_token:
+            hec_token = local_token
+            logger.info(f"Using local token from browser for destination: {destination_id}")
+        else:
+            # Fetch decrypted token from backend as fallback
+            token_resp = requests.get(
+                f"{API_BASE_URL}/api/v1/destinations/{destination_id}/token",
+                headers=_get_api_headers(),
+                timeout=10
+            )
+            if token_resp.status_code != 200:
+                return jsonify({'error': 'Failed to retrieve HEC token. Please set a local token in Settings.'}), 400
+            
+            hec_token = token_resp.json().get('token')
+            logger.info(f"Using backend token for destination: {destination_id}")
         
         if not hec_url or not hec_token:
             return jsonify({'error': 'HEC destination incomplete or token missing'}), 400
@@ -326,6 +397,8 @@ def run_scenario():
                 'quick_scenario_simple': 'quick_scenario_simple.py',
                 'scenario_hec_sender': 'scenario_hec_sender.py',
                 'star_trek_integration_test': 'star_trek_integration_test.py',
+                'finance_mfa_fatigue_scenario': 'finance_mfa_fatigue_scenario.py',
+                'insider_cloud_download_exfiltration': 'insider_cloud_download_exfiltration.py',
             }
             scenarios_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Backend', 'scenarios'))
             # Resolve script path
@@ -341,6 +414,14 @@ def run_scenario():
             env['S1_HEC_URL'] = hec_url.rstrip('/')
             env['S1_HEC_WORKERS'] = str(worker_count)  # Pass worker count to scripts
             env['S1_HEC_BATCH'] = '0'  # Disable batch mode for immediate responses
+            # Prefer a writable location inside the container for scenario outputs
+            env['SCENARIO_OUTPUT_DIR'] = '/app/data/scenarios/configs'
+            # Control inclusion of scenario.phase tag via env
+            env['S1_TAG_PHASE'] = '1' if tag_phase else '0'
+            # Control inclusion of scenario.trace_id tag via env
+            env['S1_TAG_TRACE'] = '1' if tag_trace else '0'
+            if trace_id:
+                env['S1_TRACE_ID'] = trace_id
             
             # Add event generators and all category subdirectories to Python path
             event_generators_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Backend', 'event_generators'))
@@ -384,13 +465,445 @@ def run_scenario():
             process.wait()
             rc = process.returncode
             if rc == 0:
-                yield "INFO: Scenario execution complete\n"
+                yield "INFO: Scenario generation complete\n"
+                # If this scenario produces a JSON file, automatically replay it to HEC
+                try:
+                    if scenario_id in ['finance_mfa_fatigue_scenario', 'insider_cloud_download_exfiltration']:
+                        from os import path
+                        output_dir = env.get('SCENARIO_OUTPUT_DIR', path.join(scenarios_dir, 'configs'))
+                        output_file = path.join(output_dir, f'{scenario_id}.json')
+                        if not path.exists(output_file):
+                            # Fallback to scenarios/configs
+                            fallback = path.join(scenarios_dir, 'configs', f'{scenario_id}.json')
+                            if path.exists(fallback):
+                                output_file = fallback
+                        if path.exists(output_file):
+                            yield f"INFO: Replaying generated scenario to HEC: {output_file}\n"
+                            sender_path = os.path.join(scenarios_dir, 'scenario_hec_sender.py')
+                            send_proc = subprocess.Popen(
+                                ['python', sender_path, '--scenario', output_file, '--auto', '--preserve-timestamps'] +
+                                ([] if tag_phase else ['--no-phase-tag']) +
+                                ([] if not trace_id else ['--trace-id', trace_id]),
+                                cwd=scenarios_dir,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                env=env
+                            )
+                            for sline in iter(send_proc.stdout.readline, ''):
+                                if not sline:
+                                    break
+                                yield sline
+                            send_proc.wait()
+                            if send_proc.returncode == 0:
+                                yield "INFO: Scenario replay to HEC complete\n"
+                                
+                                # Generate and send background noise if requested
+                                if generate_noise and scenario_id == 'finance_mfa_fatigue_scenario':
+                                    yield "\n" + "="*80 + "\n"
+                                    yield "INFO: Generating background noise data...\n"
+                                    yield f"INFO: Creating {noise_events_count} distributed events across 8 days\n"
+                                    yield f"INFO: Distribution: 70% business hours (8 AM - 5 PM EST), 30% off-hours\n"
+                                    yield "="*80 + "\n"
+                                    
+                                    try:
+                                        noise_gen_path = os.path.join(scenarios_dir, 'finance_mfa_noise_generator.py')
+                                        noise_proc = subprocess.Popen(
+                                            ['python', noise_gen_path, '--events', str(noise_events_count), '--days', '8'],
+                                            cwd=scenarios_dir,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT,
+                                            text=True,
+                                            env=env
+                                        )
+                                        for nline in iter(noise_proc.stdout.readline, ''):
+                                            if not nline:
+                                                break
+                                            yield nline
+                                        noise_proc.wait()
+                                        
+                                        if noise_proc.returncode == 0:
+                                            # Check if streaming mode was used (large volume)
+                                            if noise_events_count > 10000:
+                                                yield "\nINFO: Streaming mode - noise events sent directly to HEC\n"
+                                            else:
+                                                # Send noise to HEC via sender script for small volumes
+                                                noise_file = path.join(output_dir, 'finance_mfa_noise.json')
+                                                if not path.exists(noise_file):
+                                                    noise_file = path.join(scenarios_dir, 'configs', 'finance_mfa_noise.json')
+                                                
+                                                if path.exists(noise_file):
+                                                    yield f"\nINFO: Sending background noise to HEC: {noise_file}\n"
+                                                    noise_send_proc = subprocess.Popen(
+                                                        ['python', sender_path, '--scenario', noise_file, '--auto', '--preserve-timestamps'] +
+                                                        ([] if tag_phase else ['--no-phase-tag']) +
+                                                        ([] if not trace_id else ['--trace-id', trace_id]),
+                                                        cwd=scenarios_dir,
+                                                        stdout=subprocess.PIPE,
+                                                        stderr=subprocess.STDOUT,
+                                                        text=True,
+                                                        env=env
+                                                    )
+                                                    for nsline in iter(noise_send_proc.stdout.readline, ''):
+                                                        if not nsline:
+                                                            break
+                                                        yield nsline
+                                                    noise_send_proc.wait()
+                                                    if noise_send_proc.returncode == 0:
+                                                        yield "\nINFO: Background noise sent to HEC successfully\n"
+                                                    else:
+                                                        yield f"\nERROR: Noise replay exited with code {noise_send_proc.returncode}\n"
+                                                else:
+                                                    yield "\nWARN: Generated noise file not found; skipping HEC replay\n"
+                                        else:
+                                            yield f"\nERROR: Noise generation exited with code {noise_proc.returncode}\n"
+                                    except Exception as ne:
+                                        yield f"\nERROR: Failed to generate/send background noise: {ne}\n"
+                            else:
+                                yield f"ERROR: Scenario replay exited with code {send_proc.returncode}\n"
+                        else:
+                            yield "WARN: Generated scenario file not found; skipping HEC replay\n"
+                except Exception as e:
+                    yield f"ERROR: Failed to replay scenario to HEC: {e}\n"
             else:
                 yield f"ERROR: Scenario exited with code {rc}\n"
         except Exception as e:
             yield f"ERROR: Scenario execution failed: {e}\n"
     
     return Response(stream_with_context(generate_and_stream()), mimetype='text/plain')
+
+@app.route('/uploads', methods=['POST'])
+def upload_file():
+    """Upload a CSV, JSON, TXT, LOG, or GZ file"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    # Validate file extension
+    allowed_extensions = {'.csv', '.json', '.txt', '.log', '.gz'}
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in allowed_extensions:
+        return jsonify({'error': f'Invalid file type. Allowed: CSV, JSON, TXT, LOG, GZ'}), 400
+    
+    try:
+        # Forward to backend API
+        files = {'file': (file.filename, file.stream, file.content_type)}
+        resp = requests.post(
+            f"{API_BASE_URL}/api/v1/uploads/upload",
+            files=files,
+            headers=_get_api_headers(),
+            timeout=300  # 5 min timeout for large files
+        )
+        
+        if resp.status_code == 201:
+            return jsonify(resp.json()), 201
+        else:
+            error_detail = resp.json().get('detail', resp.text) if resp.headers.get('content-type') == 'application/json' else resp.text
+            return jsonify({'error': error_detail}), resp.status_code
+    except Exception as e:
+        logger.error(f"Failed to upload file: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/uploads', methods=['GET'])
+def list_uploads():
+    """List uploaded files"""
+    try:
+        resp = requests.get(
+            f"{API_BASE_URL}/api/v1/uploads/uploads",
+            headers=_get_api_headers(),
+            timeout=10
+        )
+        if resp.status_code == 200:
+            return jsonify({'uploads': resp.json()})
+        else:
+            return jsonify({'error': f'Backend error: {resp.status_code}'}), resp.status_code
+    except Exception as e:
+        logger.error(f"Failed to list uploads: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/uploads/<upload_id>', methods=['DELETE'])
+def delete_upload(upload_id: str):
+    """Delete an uploaded file"""
+    try:
+        resp = requests.delete(
+            f"{API_BASE_URL}/api/v1/uploads/uploads/{upload_id}",
+            headers=_get_api_headers(),
+            timeout=10
+        )
+        if resp.status_code == 204:
+            return ('', 204)
+        else:
+            error_detail = resp.json().get('detail', resp.text) if resp.headers.get('content-type') == 'application/json' else resp.text
+            return jsonify({'error': error_detail}), resp.status_code
+    except Exception as e:
+        logger.error(f"Failed to delete upload: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/uploads/process', methods=['POST'])
+def process_upload():
+    """Process an uploaded file through HEC"""
+    data = request.json
+    upload_id = data.get('upload_id')
+    destination_id = data.get('destination_id')
+    batch_size = int(data.get('batch_size', 100))
+    eps = float(data.get('eps', 10.0))
+    sourcetype = data.get('sourcetype', '').strip()
+    endpoint = data.get('endpoint', 'event')  # 'event' or 'raw'
+    local_token = data.get('hec_token')  # Token from browser localStorage
+    
+    if not upload_id:
+        return jsonify({'error': 'upload_id is required'}), 400
+    if not destination_id:
+        return jsonify({'error': 'destination_id is required'}), 400
+    if not sourcetype:
+        return jsonify({'error': 'sourcetype is required'}), 400
+    
+    def generate_and_stream():
+        try:
+            # Get upload metadata from backend
+            upload_resp = requests.get(
+                f"{API_BASE_URL}/api/v1/uploads/uploads/{upload_id}",
+                headers=_get_api_headers(),
+                timeout=10
+            )
+            if upload_resp.status_code != 200:
+                yield "ERROR: Upload not found\n"
+                return
+            
+            upload_info = upload_resp.json()
+            file_type = upload_info.get('file_type')
+            line_count = upload_info.get('line_count', 0)
+            
+            # Get destination info
+            dest_resp = requests.get(
+                f"{API_BASE_URL}/api/v1/destinations/{destination_id}",
+                headers=_get_api_headers(),
+                timeout=10
+            )
+            if dest_resp.status_code != 200:
+                yield "ERROR: Destination not found\n"
+                return
+            
+            destination = dest_resp.json()
+            if destination.get('type') != 'hec':
+                yield "ERROR: Only HEC destinations are supported for file uploads\n"
+                return
+            
+            hec_url = destination.get('url')
+            
+            # Use local token if provided, otherwise fetch from backend
+            if local_token:
+                hec_token = local_token
+                logger.info(f"Using local token from browser for destination: {destination_id}")
+            else:
+                # Get decrypted token from backend as fallback
+                token_resp = requests.get(
+                    f"{API_BASE_URL}/api/v1/destinations/{destination_id}/token",
+                    headers=_get_api_headers(),
+                    timeout=10
+                )
+                if token_resp.status_code != 200:
+                    yield "ERROR: Failed to retrieve HEC token. Please set a local token in Settings.\n"
+                    return
+                
+                hec_token = token_resp.json().get('token')
+                logger.info(f"Using backend token for destination: {destination_id}")
+            
+            yield f"INFO: Processing {file_type.upper()} file with {line_count} records\n"
+            yield f"INFO: Sending to {hec_url} at {eps} EPS\n"
+            yield f"INFO: Using sourcetype: {sourcetype}\n"
+            yield f"INFO: HEC Endpoint: /{endpoint}\n"
+            
+            # Read the uploaded file from backend data directory
+            # Since we're in Flask, we need to read from the backend's upload directory
+            backend_upload_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Backend', 'api', 'data', 'uploads'))
+            safe_filename = upload_info.get('id') + '_' + upload_info.get('filename')
+            file_path = os.path.join(backend_upload_dir, safe_filename)
+            
+            if not os.path.exists(file_path):
+                yield f"ERROR: File not found at {file_path}\n"
+                return
+            
+            # Process file and send to HEC
+            import time as time_module
+            delay = 1.0 / eps if eps > 0 else 0.1
+            sent_count = 0
+            
+            # Build path to hec_sender.py
+            hec_sender_path = os.path.normpath(
+                os.path.join(os.path.dirname(__file__), '..', 'Backend', 'event_generators', 'shared', 'hec_sender.py')
+            )
+            
+            # Build HEC URL with endpoint
+            base_hec_url = hec_url.rstrip('/')
+            if not base_hec_url.endswith('/services/collector'):
+                base_hec_url += '/services/collector'
+            
+            if endpoint == 'event':
+                hec_endpoint_url = f"{base_hec_url}/event"
+            else:
+                hec_endpoint_url = f"{base_hec_url}/raw?sourcetype={sourcetype}"
+            
+            if file_type == 'json':
+                with open(file_path, 'r') as f:
+                    data_content = json.load(f)
+                    records = data_content if isinstance(data_content, list) else [data_content]
+                    
+                    for record in records:
+                        try:
+                            if endpoint == 'event':
+                                # Send to HEC /event endpoint with sourcetype in payload
+                                headers_local = {
+                                    'Authorization': f'Splunk {hec_token}',
+                                    'Content-Type': 'application/json'
+                                }
+                                payload = {
+                                    'event': record,
+                                    'sourcetype': sourcetype
+                                }
+                                resp = requests.post(
+                                    hec_endpoint_url,
+                                    json=payload,
+                                    headers=headers_local,
+                                    verify=True,
+                                    timeout=10
+                                )
+                            else:
+                                # Send to HEC /raw endpoint (sourcetype in URL)
+                                headers_local = {
+                                    'Authorization': f'Splunk {hec_token}',
+                                    'Content-Type': 'text/plain'
+                                }
+                                # Convert JSON to string for raw endpoint
+                                raw_data = json.dumps(record) if isinstance(record, dict) else str(record)
+                                resp = requests.post(
+                                    hec_endpoint_url,
+                                    data=raw_data,
+                                    headers=headers_local,
+                                    verify=True,
+                                    timeout=10
+                                )
+                            
+                            resp.raise_for_status()
+                            sent_count += 1
+                            if sent_count % 10 == 0:
+                                yield f"INFO: Sent {sent_count}/{len(records)} events\n"
+                            time_module.sleep(delay)
+                        except Exception as e:
+                            yield f"ERROR: Failed to send event: {e}\n"
+                            
+            elif file_type == 'csv':
+                with open(file_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    records = list(reader)
+                    
+                    for record in records:
+                        try:
+                            if endpoint == 'event':
+                                # Send to HEC /event endpoint as JSON with sourcetype
+                                headers_local = {
+                                    'Authorization': f'Splunk {hec_token}',
+                                    'Content-Type': 'application/json'
+                                }
+                                payload = {
+                                    'event': record,
+                                    'sourcetype': sourcetype
+                                }
+                                resp = requests.post(
+                                    hec_endpoint_url,
+                                    json=payload,
+                                    headers=headers_local,
+                                    verify=True,
+                                    timeout=10
+                                )
+                            else:
+                                # Send to HEC /raw endpoint (sourcetype in URL)
+                                headers_local = {
+                                    'Authorization': f'Splunk {hec_token}',
+                                    'Content-Type': 'text/plain'
+                                }
+                                # Convert CSV row to key=value format for raw endpoint
+                                raw_data = ' '.join([f'{k}={v}' for k, v in record.items()])
+                                resp = requests.post(
+                                    hec_endpoint_url,
+                                    data=raw_data,
+                                    headers=headers_local,
+                                    verify=True,
+                                    timeout=10
+                                )
+                            
+                            resp.raise_for_status()
+                            sent_count += 1
+                            if sent_count % 10 == 0:
+                                yield f"INFO: Sent {sent_count}/{len(records)} events\n"
+                            time_module.sleep(delay)
+                        except Exception as e:
+                            yield f"ERROR: Failed to send event: {e}\n"
+            
+            elif file_type in ['txt', 'log']:
+                # Process text/log files line by line
+                with open(file_path, 'r') as f:
+                    lines = [line.rstrip('\n') for line in f if line.strip()]
+                    
+                    for line in lines:
+                        try:
+                            if endpoint == 'event':
+                                # Send to HEC /event endpoint (wrap line in JSON)
+                                headers_local = {
+                                    'Authorization': f'Splunk {hec_token}',
+                                    'Content-Type': 'application/json'
+                                }
+                                payload = {
+                                    'event': line,
+                                    'sourcetype': sourcetype
+                                }
+                                resp = requests.post(
+                                    hec_endpoint_url,
+                                    json=payload,
+                                    headers=headers_local,
+                                    verify=True,
+                                    timeout=10
+                                )
+                            else:
+                                # Send to HEC /raw endpoint
+                                headers_local = {
+                                    'Authorization': f'Splunk {hec_token}',
+                                    'Content-Type': 'text/plain'
+                                }
+                                resp = requests.post(
+                                    hec_endpoint_url,
+                                    data=line,
+                                    headers=headers_local,
+                                    verify=True,
+                                    timeout=10
+                                )
+                            
+                            resp.raise_for_status()
+                            sent_count += 1
+                            if sent_count % 10 == 0:
+                                yield f"INFO: Sent {sent_count}/{len(lines)} events\n"
+                            time_module.sleep(delay)
+                        except Exception as e:
+                            yield f"ERROR: Failed to send event: {e}\n"
+            
+            else:
+                yield f"ERROR: Unsupported file type: {file_type}\n"
+                return
+            
+            yield f"INFO: Successfully sent {sent_count} events to HEC\n"
+            
+        except Exception as e:
+            logger.error(f"Failed to process upload: {e}", exc_info=True)
+            yield f"ERROR: Failed to process upload: {e}\n"
+    
+    return Response(stream_with_context(generate_and_stream()), mimetype='text/plain')
+
 
 @app.route('/get-scripts', methods=['GET'])
 def get_available_scripts():
@@ -404,17 +917,30 @@ def generate_logs():
     data = request.json
     destination = data.get('destination', 'syslog')
     script_path = data.get('script')
-    log_count = int(data.get('count', 3))
+    log_count = int(data.get('count', 3)) if data.get('count') is not None else None
     eps = float(data.get('eps', 1.0))
+    continuous = data.get('continuous', False)
+    speed_mode = data.get('speed_mode', False)
     syslog_ip = data.get('ip')
     syslog_port = int(data.get('port')) if data.get('port') is not None else None
     syslog_protocol = data.get('protocol')
     product_id = data.get('product')
+    local_hec_token = data.get('hec_token')  # Token from browser localStorage
+    metadata_fields = data.get('metadata')  # Custom metadata fields as JSON object
     # Unified destination id (preferred)
     unified_dest_id = data.get('destination_id')
     # Back-compat fields
     hec_dest_id = data.get('hec_destination_id')
     syslog_dest_id = data.get('syslog_destination_id')
+    
+    # Auto-enable speed mode for high EPS
+    if continuous and eps > 1000 and not speed_mode:
+        speed_mode = True
+        logger.info("Auto-enabling Speed Mode for high throughput (>1000 EPS)")
+    
+    # Set log_count to a large number for continuous mode
+    if continuous:
+        log_count = 999999999  # Effectively infinite
     
     if destination == 'syslog':
         full_script_path = os.path.join(EVENT_GENERATORS_DIR, script_path)
@@ -538,17 +1064,23 @@ def generate_logs():
                     hec_url = chosen.get('url')
                     dest_id = chosen.get('id')
                     
-                    # Fetch decrypted token from backend
-                    token_resp = requests.get(
-                        f"{API_BASE_URL}/api/v1/destinations/{dest_id}/token",
-                        headers=_get_api_headers(),
-                        timeout=10
-                    )
-                    if token_resp.status_code != 200:
-                        yield "ERROR: Failed to retrieve HEC token from backend.\n"
-                        return
-                    
-                    hec_token = token_resp.json().get('token')
+                    # Use local token if provided, otherwise fetch from backend
+                    if local_hec_token:
+                        hec_token = local_hec_token
+                        logger.info(f"Using local token from browser for destination: {dest_id}")
+                    else:
+                        # Fetch decrypted token from backend as fallback
+                        token_resp = requests.get(
+                            f"{API_BASE_URL}/api/v1/destinations/{dest_id}/token",
+                            headers=_get_api_headers(),
+                            timeout=10
+                        )
+                        if token_resp.status_code != 200:
+                            yield "ERROR: Failed to retrieve HEC token from backend. Please set a local token in Settings.\n"
+                            return
+                        
+                        hec_token = token_resp.json().get('token')
+                        logger.info(f"Using backend token for destination: {dest_id}")
                     
                     if not hec_url or not hec_token:
                         yield "ERROR: Selected HEC destination is incomplete or token missing.\n"
@@ -561,15 +1093,22 @@ def generate_logs():
                     return
 
                 yield f"INFO: Starting HEC send to {hec_url}...\n"
-                yield f"INFO: Sending {log_count} events for product '{product_id}' at {eps} EPS\n"
+                if continuous:
+                    speed_indicator = " (SPEED MODE)" if speed_mode else ""
+                    yield f"INFO: Running in CONTINUOUS mode for product '{product_id}' at {eps} EPS{speed_indicator} (press Stop to end)\n"
+                else:
+                    yield f"INFO: Sending {log_count} events for product '{product_id}' at {eps} EPS\n"
 
                 # Build path to hec_sender.py (Frontend/../Backend/event_generators/shared/hec_sender.py)
                 hec_sender_path = os.path.normpath(
                     os.path.join(os.path.dirname(__file__), '..', 'Backend', 'event_generators', 'shared', 'hec_sender.py')
                 )
                 if not os.path.exists(hec_sender_path):
-                    yield "ERROR: HEC sender not found.\n"
+                    yield f"ERROR: HEC sender not found at {hec_sender_path}\n"
                     return
+                
+                yield f"DEBUG: Using HEC sender at {hec_sender_path}\n"
+                yield f"DEBUG: Product: {product_id}, Count: {log_count}, EPS: {eps}, Continuous: {continuous}, Speed Mode: {speed_mode}\n"
 
                 # Normalize HEC URL: accept bare domain and append collector path
                 def _normalize_hec_url(u: str) -> str:
@@ -589,53 +1128,151 @@ def generate_logs():
                 env = os.environ.copy()
                 env['S1_HEC_TOKEN'] = hec_token
                 env['S1_HEC_URL'] = normalized_hec_url
-                # Disable batch mode to get immediate HTTP responses
-                env['S1_HEC_BATCH'] = '0'
-                # Enable debug output to see exact payloads
+                # Enable TLS compatibility for older/misconfigured servers
+                env['S1_HEC_TLS_LOW'] = '1'
+                # Enable automatic insecure fallback as last resort
+                env['S1_HEC_AUTO_INSECURE'] = 'true'
+                
+                if continuous:
+                    # Batch mode for continuous
+                    env['S1_HEC_BATCH'] = '1'
+                    # Optimize batch size based on EPS
+                    if eps >= 10000:
+                        # High EPS: larger batches, faster flush
+                        env['S1_HEC_BATCH_MAX_BYTES'] = str(2 * 1024 * 1024)  # 2MB batches for high throughput
+                        env['S1_HEC_BATCH_FLUSH_MS'] = '200'  # Flush every 0.2 seconds (5x per second)
+                    elif eps >= 1000:
+                        # Medium EPS: balanced batches
+                        env['S1_HEC_BATCH_MAX_BYTES'] = str(512 * 1024)  # 512KB batches
+                        env['S1_HEC_BATCH_FLUSH_MS'] = '300'  # Flush every 0.3 seconds
+                    else:
+                        # Low EPS: smaller batches for visibility
+                        env['S1_HEC_BATCH_MAX_BYTES'] = str(256 * 1024)  # 256KB batches
+                        env['S1_HEC_BATCH_FLUSH_MS'] = '500'  # Flush every 0.5 seconds
+                else:
+                    # Single-send mode for small counts
+                    env['S1_HEC_BATCH'] = '0'
+                
+                # Enable debug output to see batch flushes and responses
                 env['S1_HEC_DEBUG'] = '1'
+                # Disable Python output buffering
+                env['PYTHONUNBUFFERED'] = '1'
 
                 # Calculate delay from EPS: delay = 1 / eps
                 delay = 1.0 / eps if eps > 0 else 1.0
-                command = ['python3', hec_sender_path, '--product', product_id, '-n', str(log_count), 
-                           '--min-delay', str(delay), '--max-delay', str(delay), '--print-responses']
-                logger.info(f"Executing HEC sender: {' '.join(command)}")
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=env
-                )
+                # Use -u flag for unbuffered Python output
+                # Use --verbosity info for periodic status updates instead of per-event output
+                command = ['python3', '-u', hec_sender_path, '--product', product_id, '-n', str(log_count), 
+                           '--min-delay', str(delay), '--max-delay', str(delay), '--verbosity', 'info']
+                
+                # Add metadata fields if provided
+                if metadata_fields:
+                    # Metadata should be a dict, convert to JSON string for command line
+                    import json as json_module
+                    if isinstance(metadata_fields, dict):
+                        command.extend(['--metadata', json_module.dumps(metadata_fields)])
+                        logger.info(f"Adding metadata fields: {metadata_fields}")
+                    else:
+                        logger.warning(f"Invalid metadata format (expected dict): {type(metadata_fields)}")
+                
+                # Add speed mode flag
+                if speed_mode:
+                    command.append('--speed-mode')
+                
+                command_str = ' '.join(command)
+                logger.info(f"Executing HEC sender: {command_str}")
+                yield f"DEBUG: Running command: {command_str}\n"
+                yield f"DEBUG: Environment vars: S1_HEC_BATCH={env.get('S1_HEC_BATCH')}, S1_HEC_DEBUG={env.get('S1_HEC_DEBUG')}\n"
+                
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,  # Merge stderr into stdout for better debugging
+                        text=True,
+                        bufsize=1,  # Line buffered
+                        env=env
+                    )
+                    yield f"DEBUG: Process started with PID {process.pid}\n"
+                except Exception as e:
+                    yield f"ERROR: Failed to start process: {e}\n"
+                    logger.error(f"Failed to start HEC sender process: {e}", exc_info=True)
+                    return
 
                 # Stream sanitized output
                 line_count = 0
-                for line in iter(process.stdout.readline, ''):
-                    if not line:
-                        break
-                    line_count += 1
-                    # Redact token from output
-                    sanitized = line.replace(hec_token, '***REDACTED***')
-                    yield sanitized
-                    logger.debug(f"HEC sender output line {line_count}: {sanitized.strip()}")
+                event_count = 0
+                import select
+                
+                yield "DEBUG: Starting to read output...\n"
+                
+                try:
+                    # Check if process exits immediately
+                    import time
+                    time.sleep(0.5)
+                    poll_result = process.poll()
+                    if poll_result is not None:
+                        # Process exited immediately
+                        remaining_output = process.stdout.read()
+                        yield f"ERROR: Process exited immediately with code {poll_result}\n"
+                        if remaining_output:
+                            sanitized = remaining_output.replace(hec_token, '***REDACTED***')
+                            yield f"Output:\n{sanitized}\n"
+                        return
+                    
+                    yield "DEBUG: Process is running, reading output lines...\n"
+                    
+                    for line in iter(process.stdout.readline, ''):
+                        if not line:
+                            # Check if process has exited
+                            if process.poll() is not None:
+                                yield f"DEBUG: Process exited with code {process.returncode}\n"
+                                break
+                            continue
+                        
+                        # Check if client disconnected (for continuous mode)
+                        if request.environ.get('werkzeug.socket'):
+                            try:
+                                # This will fail if client disconnected
+                                request.environ.get('werkzeug.socket').getpeername()
+                            except:
+                                logger.info("Client disconnected, terminating process")
+                                process.terminate()
+                                yield "INFO: Stopped by client disconnect\n"
+                                break
+                        
+                        line_count += 1
+                        # Redact token from output
+                        sanitized = line.replace(hec_token, '***REDACTED***')
+                        yield sanitized
+                        logger.debug(f"HEC sender output line {line_count}: {sanitized.strip()}")
+                        
+                        # Count successful events for continuous mode progress
+                        if continuous:
+                            # Count based on status messages (QUEUED for batch, OK for non-batch)
+                            if 'queued' in sanitized.lower() or ('status' in sanitized.lower() and 'ok' in sanitized.lower()):
+                                event_count += 1
+                                if event_count % 100 == 0:
+                                    yield f"INFO: {event_count} events queued/sent so far...\n"
+                except (GeneratorExit, BrokenPipeError):
+                    # Client disconnected
+                    logger.info("Client disconnected (broken pipe), terminating process")
+                    process.terminate()
+                    return
 
-                # Capture any errors or additional output
+                # Wait for process completion
                 process.wait()
-                stderr_output = process.stderr.read() if process.stderr else ""
                 logger.info(f"HEC sender process completed with return code: {process.returncode}")
                 
-                if stderr_output:
-                    sanitized_stderr = stderr_output.replace(hec_token, '***REDACTED***')
-                    logger.info(f"HEC sender stderr: {sanitized_stderr}")
-                    # Show stderr output (may contain debug info)
-                    if sanitized_stderr.strip():
-                        yield f"DEBUG: {sanitized_stderr}\n"
-                
-                if process.returncode != 0:
+                # -15 is SIGTERM from our terminate() call
+                if process.returncode != 0 and process.returncode != -15:
                     logger.error(f"HEC send failed with return code {process.returncode}")
                     yield f"ERROR: HEC send failed with code {process.returncode}\n"
+                elif continuous and event_count > 0:
+                    yield f"INFO: Stopped after sending {event_count} events\n"
                 else:
-                    yield f"INFO: Successfully sent {log_count} events to HEC\n"
-                    logger.info(f"Successfully sent {log_count} events")
+                    yield f"INFO: Successfully sent {log_count if not continuous else event_count} events to HEC\n"
+                    logger.info(f"Successfully sent {log_count if not continuous else event_count} events")
 
         except FileNotFoundError:
             yield f"ERROR: Python executable not found. Please ensure Python is in your system's PATH.\n"
