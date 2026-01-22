@@ -23,6 +23,10 @@ class DestinationCreate(BaseModel):
     url: Optional[str] = Field(None, description="HEC URL (required for HEC destinations)")
     token: Optional[str] = Field(None, description="HEC token (required for HEC destinations)")
     
+    # Config API for parser management
+    config_api_url: Optional[str] = Field(None, description="Config API URL for parser management (e.g., https://xdr.us1.sentinelone.net)")
+    config_write_token: Optional[str] = Field(None, description="Config API token for reading and writing parsers")
+    
     # Syslog fields
     ip: Optional[str] = Field(None, description="Syslog IP (required for syslog destinations)")
     port: Optional[int] = Field(None, description="Syslog port (required for syslog destinations)")
@@ -34,6 +38,8 @@ class DestinationUpdate(BaseModel):
     name: Optional[str] = None
     url: Optional[str] = None
     token: Optional[str] = None
+    config_api_url: Optional[str] = None
+    config_write_token: Optional[str] = None
     ip: Optional[str] = None
     port: Optional[int] = None
     protocol: Optional[str] = None
@@ -51,6 +57,8 @@ class DestinationResponse(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     has_database_token: Optional[bool] = None  # True if token is in DB, False if LOCAL_STORAGE
+    config_api_url: Optional[str] = None  # Config API URL for parser management
+    has_config_write_token: Optional[bool] = None  # True if config API token is set
 
 
 class DestinationWithToken(DestinationResponse):
@@ -125,6 +133,8 @@ async def create_destination(
             dest_type=destination.type,
             url=destination.url,
             token=destination.token,
+            config_api_url=destination.config_api_url,
+            config_write_token=destination.config_write_token,
             ip=destination.ip,
             port=destination.port,
             protocol=destination.protocol
@@ -255,6 +265,8 @@ async def update_destination(
             name=update.name,
             url=update.url,
             token=update.token,
+            config_api_url=update.config_api_url,
+            config_write_token=update.config_write_token,
             ip=update.ip,
             port=update.port,
             protocol=update.protocol
@@ -294,3 +306,47 @@ async def delete_destination(
         )
     
     return None
+
+
+@router.get("/{dest_id}/config-tokens")
+async def get_destination_config_tokens(
+    dest_id: str,
+    session: AsyncSession = Depends(get_session),
+    auth_info: tuple = Depends(get_api_key)
+):
+    """
+    Get decrypted config token for a destination (internal use only)
+    
+    Returns the decrypted config API token for parser management
+    """
+    service = DestinationService(session)
+    destination = await service.get_destination(dest_id)
+    if not destination:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Destination '{dest_id}' not found"
+        )
+    
+    if destination.type != 'hec':
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only HEC destinations support config tokens"
+        )
+    
+    result = {
+        "config_write_token": None
+    }
+    
+    try:
+        if destination.config_write_token_encrypted:
+            result["config_write_token"] = service.decrypt_token(
+                destination.config_write_token_encrypted
+            )
+        
+        return result
+    except Exception as e:
+        logger.error(f"Failed to decrypt config token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to decrypt config token"
+        )

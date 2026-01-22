@@ -210,6 +210,48 @@ def update_destination_token(dest_id):
         logger.error(f"Failed to update destination token: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/destinations/<dest_id>', methods=['PUT'])
+def update_destination(dest_id):
+    """Update destination fields"""
+    try:
+        data = request.json or {}
+        
+        payload = {}
+        if data.get('name'):
+            payload['name'] = data['name']
+        if data.get('url'):
+            payload['url'] = data['url']
+        if data.get('token'):
+            payload['token'] = data['token']
+        if data.get('config_api_url'):
+            payload['config_api_url'] = data['config_api_url']
+        if data.get('config_read_token'):
+            payload['config_read_token'] = data['config_read_token']
+        if data.get('config_write_token'):
+            payload['config_write_token'] = data['config_write_token']
+        
+        if not payload:
+            return jsonify({'error': 'No fields provided to update'}), 400
+        
+        response = requests.put(
+            f"{API_BASE_URL}/api/v1/destinations/{dest_id}",
+            headers=_get_api_headers(),
+            json=payload,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            logger.info(f"Updated destination: {dest_id}")
+            return jsonify(response.json())
+        else:
+            error_text = response.text
+            logger.error(f"Backend returned {response.status_code}: {error_text}")
+            return jsonify({'error': f'Backend returned {response.status_code}'}), response.status_code
+            
+    except Exception as e:
+        logger.error(f"Failed to update destination: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/scenarios', methods=['GET'])
 def list_scenarios():
     """List available attack scenarios"""
@@ -224,52 +266,28 @@ def list_scenarios():
             'phases': ['Reconnaissance & Phishing', 'Initial Access', 'Persistence & Lateral Movement', 'Privilege Escalation', 'Data Exfiltration']
         },
         {
-            'id': 'enterprise_attack_scenario',
-            'name': 'Enterprise Breach Scenario',
-            'description': 'Enhanced enterprise attack scenario with 330+ events across multiple security products. Demonstrates correlated attack patterns.',
-            'duration_minutes': 60,
-            'total_events': 330,
-            'phases': ['Initial Compromise', 'Credential Harvesting', 'Lateral Movement', 'Privilege Escalation', 'Data Exfiltration', 'Persistence']
-        },
-        {
-            'id': 'enterprise_attack_scenario_10min',
-            'name': 'Enterprise Breach (10 min)',
-            'description': 'Condensed enterprise breach scenario for quick demos.',
-            'duration_minutes': 10,
-            'total_events': 120,
-            'phases': ['Initial Access', 'Lateral Movement', 'Exfiltration']
-        },
-        {
             'id': 'enterprise_scenario_sender',
-            'name': 'Enterprise Scenario Sender (330+ events)',
-            'description': 'Sends enhanced enterprise attack scenario events to HEC using proper routing.',
+            'name': 'Enterprise Attack Scenario',
+            'description': 'Enhanced enterprise attack scenario with 330+ events across 18+ security platforms. Generates and sends events to HEC.',
             'duration_minutes': 45,
             'total_events': 330,
-            'phases': ['Initial Compromise', 'Credential Harvesting', 'Lateral Movement', 'Privilege Escalation', 'Data Exfiltration']
-        },
-        {
-            'id': 'enterprise_scenario_sender_10min',
-            'name': 'Enterprise Scenario Sender (10 min)',
-            'description': 'Fast sender for enterprise scenario suitable for time-boxed demos.',
-            'duration_minutes': 10,
-            'total_events': 120,
-            'phases': ['Initial Access', 'Lateral Movement', 'Exfiltration']
-        },
-        {
-            'id': 'showcase_attack_scenario',
-            'name': 'AI-SIEM Showcase Scenario',
-            'description': 'Showcase scenario demonstrating multi-platform correlation across EDR, Email, Identity, Cloud, Network, WAF, and more.',
-            'duration_minutes': 30,
-            'total_events': 200,
-            'phases': ['Phishing', 'Compromise', 'Movement', 'Privilege Escalation', 'Exfiltration']
+            'phases': ['Perimeter Breach', 'Phishing & Initial Access', 'Credential Harvesting', 'Lateral Movement', 'Privilege Escalation', 'Persistence & Exfiltration']
         },
         {
             'id': 'showcase_scenario_sender',
-            'name': 'Showcase Scenario Sender',
-            'description': 'Sends the showcase scenario events to HEC with compact progress output.',
+            'name': 'AI-SIEM Showcase Scenario',
+            'description': 'Showcase scenario demonstrating multi-platform correlation across EDR, Email, Identity, Cloud, Network, WAF, and more.',
             'duration_minutes': 20,
             'total_events': 180,
-            'phases': ['Phishing', 'Compromise', 'Movement', 'Exfiltration']
+            'phases': ['Perimeter Attack', 'Cloud Reconnaissance', 'Identity Compromise', 'Email Attack', 'Endpoint Compromise', 'Secrets Access', 'MFA Bypass']
+        },
+        {
+            'id': 'enterprise_scenario_sender_10min',
+            'name': 'Enterprise Breach (10 min)',
+            'description': 'Condensed enterprise breach scenario for quick demos. Generates and sends events to HEC.',
+            'duration_minutes': 10,
+            'total_events': 120,
+            'phases': ['Perimeter Breach', 'Credential Harvesting', 'Lateral Movement', 'Privilege Escalation']
         },
         {
             'id': 'quick_scenario',
@@ -320,7 +338,92 @@ def list_scenarios():
             'phases': ['Test']
         }
     ]
+    
+    # Filter out hidden scenarios
+    try:
+        headers = {'X-API-Key': BACKEND_API_KEY} if BACKEND_API_KEY else {}
+        res = requests.get(f"{API_BASE_URL}/api/v1/settings/hidden-scenarios", headers=headers, timeout=5)
+        if res.status_code == 200:
+            hidden = res.json().get('hidden_scenarios', [])
+            scenarios = [s for s in scenarios if s['id'] not in hidden]
+    except Exception as e:
+        logger.warning(f"Could not fetch hidden scenarios: {e}")
+    
     return jsonify({'scenarios': scenarios})
+
+
+@app.route('/api/v1/settings/hidden-scenarios', methods=['GET'])
+def get_hidden_scenarios():
+    """Proxy to get hidden scenarios from backend"""
+    try:
+        headers = {'X-API-Key': BACKEND_API_KEY} if BACKEND_API_KEY else {}
+        res = requests.get(f"{API_BASE_URL}/api/v1/settings/hidden-scenarios", headers=headers, timeout=5)
+        return jsonify(res.json()), res.status_code
+    except Exception as e:
+        logger.error(f"Failed to get hidden scenarios: {e}")
+        return jsonify({'hidden_scenarios': []}), 200
+
+
+@app.route('/scenarios/all', methods=['GET'])
+def list_all_scenarios():
+    """List ALL scenarios without filtering hidden ones - for settings UI"""
+    scenarios = [
+        {'id': 'attack_scenario_orchestrator', 'name': 'Operation Digital Heist'},
+        {'id': 'enterprise_scenario_sender', 'name': 'Enterprise Attack Scenario'},
+        {'id': 'showcase_scenario_sender', 'name': 'AI-SIEM Showcase Scenario'},
+        {'id': 'enterprise_scenario_sender_10min', 'name': 'Enterprise Breach (10 min)'},
+        {'id': 'quick_scenario', 'name': 'Quick Scenario (Comprehensive)'},
+        {'id': 'quick_scenario_simple', 'name': 'Quick Scenario (Simple)'},
+        {'id': 'finance_mfa_fatigue_scenario', 'name': 'Finance Employee MFA Fatigue Attack'},
+        {'id': 'insider_cloud_download_exfiltration', 'name': 'Insider Data Exfiltration via Cloud Download'},
+        {'id': 'scenario_hec_sender', 'name': 'Scenario HEC Sender'},
+        {'id': 'star_trek_integration_test', 'name': 'Integration Test (Star Trek)'}
+    ]
+    return jsonify(scenarios)
+
+
+@app.route('/api/v1/settings/hidden-scenarios', methods=['PUT'])
+def set_hidden_scenarios():
+    """Proxy to set hidden scenarios in backend"""
+    try:
+        headers = {'X-API-Key': BACKEND_API_KEY, 'Content-Type': 'application/json'} if BACKEND_API_KEY else {'Content-Type': 'application/json'}
+        res = requests.put(
+            f"{API_BASE_URL}/api/v1/settings/hidden-scenarios",
+            headers=headers,
+            json=request.json,
+            timeout=5
+        )
+        return jsonify(res.json()), res.status_code
+    except Exception as e:
+        logger.error(f"Failed to set hidden scenarios: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# Track running scenario process for stop functionality
+_running_scenario_process = None
+_running_scenario_lock = threading.Lock()
+
+@app.route('/scenarios/stop', methods=['POST'])
+def stop_scenario():
+    """Stop the currently running scenario"""
+    global _running_scenario_process
+    with _running_scenario_lock:
+        if _running_scenario_process and _running_scenario_process.poll() is None:
+            try:
+                import signal
+                # Try graceful termination first
+                _running_scenario_process.terminate()
+                try:
+                    _running_scenario_process.wait(timeout=2)
+                except:
+                    # Force kill if it doesn't respond
+                    _running_scenario_process.kill()
+                logger.info("Scenario process terminated by user")
+                return jsonify({'status': 'stopped'})
+            except Exception as e:
+                logger.error(f"Failed to stop scenario: {e}")
+                return jsonify({'error': str(e)}), 500
+        return jsonify({'status': 'no_process_running'})
 
 @app.route('/scenarios/run', methods=['POST'])
 def run_scenario():
@@ -335,6 +438,8 @@ def run_scenario():
     generate_noise = data.get('generate_noise', False)
     noise_events_count = int(data.get('noise_events_count', 1200))
     local_token = data.get('hec_token')  # Token from browser localStorage
+    sync_parsers = data.get('sync_parsers', True)  # Enable parser sync by default
+    debug_mode = data.get('debug_mode', False)  # Verbose logging mode
     
     if not scenario_id:
         return jsonify({'error': 'scenario_id is required'}), 400
@@ -342,6 +447,8 @@ def run_scenario():
         return jsonify({'error': 'destination_id is required'}), 400
     
     # Resolve destination from backend API
+    config_read_token = None
+    config_write_token = None
     try:
         dest_resp = requests.get(
             f"{API_BASE_URL}/api/v1/destinations/{destination_id}",
@@ -377,6 +484,23 @@ def run_scenario():
         
         if not hec_url or not hec_token:
             return jsonify({'error': 'HEC destination incomplete or token missing'}), 400
+        
+        # Fetch config token and URL for parser sync if available
+        config_api_url = chosen.get('config_api_url')
+        config_write_token = None
+        if sync_parsers and chosen.get('has_config_write_token') and config_api_url:
+            try:
+                config_resp = requests.get(
+                    f"{API_BASE_URL}/api/v1/destinations/{destination_id}/config-tokens",
+                    headers=_get_api_headers(),
+                    timeout=10
+                )
+                if config_resp.status_code == 200:
+                    config_tokens = config_resp.json()
+                    config_write_token = config_tokens.get('config_write_token')
+                    logger.info(f"Retrieved config token for parser sync (API URL: {config_api_url})")
+            except Exception as ce:
+                logger.warning(f"Failed to retrieve config token: {ce}")
     except Exception as e:
         logger.error(f"Failed to resolve destination: {e}")
         return jsonify({'error': f'Failed to resolve destination: {str(e)}'}), 500
@@ -384,6 +508,43 @@ def run_scenario():
     def generate_and_stream():
         try:
             yield "INFO: Starting scenario execution...\n"
+            
+            # Parser sync: Check and upload required parsers before running scenario
+            if sync_parsers and config_write_token and config_api_url:
+                yield "INFO: Checking required parsers in destination SIEM...\n"
+                try:
+                    # Call the parser sync API
+                    sync_resp = requests.post(
+                        f"{API_BASE_URL}/api/v1/parsers/sync",
+                        headers=_get_api_headers(),
+                        json={
+                            "scenario_id": scenario_id,
+                            "config_api_url": config_api_url,
+                            "config_write_token": config_write_token
+                        },
+                        timeout=120
+                    )
+                    if sync_resp.status_code == 200:
+                        sync_result = sync_resp.json()
+                        for source, info in sync_result.get('results', {}).items():
+                            status = info.get('status', 'unknown')
+                            message = info.get('message', '')
+                            if status == 'exists':
+                                yield f"INFO: Parser exists: {source}\n"
+                            elif status == 'uploaded':
+                                yield f"INFO: Parser uploaded: {source}\n"
+                            elif status == 'failed':
+                                yield f"WARN: Parser sync failed: {source} - {message}\n"
+                            elif status == 'no_parser':
+                                yield f"WARN: No parser mapping: {source}\n"
+                        yield "INFO: Parser sync complete\n"
+                    else:
+                        yield f"WARN: Parser sync API returned {sync_resp.status_code}, continuing without sync\n"
+                except Exception as pe:
+                    yield f"WARN: Parser sync failed: {pe}, continuing without sync\n"
+            elif sync_parsers:
+                yield "INFO: Parser sync skipped (missing config_api_url or config tokens for destination)\n"
+            
             # Map scenario ids to filenames when they differ
             id_to_file = {
                 'attack_scenario_orchestrator': 'attack_scenario_orchestrator.py',
@@ -411,7 +572,13 @@ def run_scenario():
             # Prepare environment for HEC sender used by scenario scripts
             env = os.environ.copy()
             env['S1_HEC_TOKEN'] = hec_token
-            env['S1_HEC_URL'] = hec_url.rstrip('/')
+            # Ensure proper URL format for HEC sender
+            clean_url = hec_url.rstrip('/')
+            if '/services/collector' not in clean_url:
+                clean_url = clean_url + '/services/collector'
+            env['S1_HEC_URL'] = clean_url
+            yield f"INFO: Using HEC URL: {clean_url}\n"
+            yield f"INFO: Debug mode: {'ON' if debug_mode else 'OFF'}\n"
             env['S1_HEC_WORKERS'] = str(worker_count)  # Pass worker count to scripts
             env['S1_HEC_BATCH'] = '0'  # Disable batch mode for immediate responses
             # Prefer a writable location inside the container for scenario outputs
@@ -444,23 +611,61 @@ def run_scenario():
                 env['PYTHONPATH'] = pythonpath_str
             
             logger.info(f"Set PYTHONPATH with {len(python_paths)} directories")
+            
+            # Output filtering function for non-debug mode
+            import re
+            important_patterns = [
+                re.compile(r'^[🚀🎯📊🔗✅❌⚠️📅🔍⬆️📤🚪🔒💾📁📈👤💻🔑]'),  # Emoji prefixes
+                re.compile(r'Phase:|Trace ID:|scenario complete|SCENARIO|Campaign|events generated|Success Rate', re.IGNORECASE),
+                re.compile(r'^INFO:|^WARN:|^ERROR:|^DEBUG:'),
+                re.compile(r'Sending \d+ events|Replaying|transmission complete|Progress:', re.IGNORECASE),
+                re.compile(r'Total Events:|Compromised|Stolen|Summary', re.IGNORECASE),
+                re.compile(r'^\s*$'),  # Empty lines (for formatting)
+            ]
+            
+            def should_output_line(line: str) -> bool:
+                """Return True if line should be shown in non-debug mode"""
+                if debug_mode:
+                    return True
+                stripped = line.strip()
+                if not stripped:
+                    return False
+                # Skip verbose debug lines (payload dumps, etc)
+                if stripped.startswith('[DEBUG]'):
+                    return False
+                # Always show errors
+                if '❌' in stripped or 'ERROR' in stripped or 'Failed' in stripped:
+                    return True
+                return any(p.search(stripped) for p in important_patterns)
 
             yield f"INFO: Executing {filename} with {worker_count} parallel workers...\n"
             import subprocess
+            
+            # Build command with appropriate flags
+            cmd = ['python', script_path]
+            # Add --non-interactive flag for scripts that support it
+            if scenario_id == 'attack_scenario_orchestrator':
+                cmd.extend(['--non-interactive', '--retroactive'])
+            
+            global _running_scenario_process
             process = subprocess.Popen(
-                ['python', script_path],
+                cmd,
                 cwd=scenarios_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 env=env
             )
+            # Track the process for stop functionality
+            with _running_scenario_lock:
+                _running_scenario_process = process
 
-            # Stream output lines
+            # Stream output lines (filtered in non-debug mode)
             for line in iter(process.stdout.readline, ''):
                 if not line:
                     break
-                yield line
+                if should_output_line(line):
+                    yield line
 
             process.wait()
             rc = process.returncode
@@ -468,7 +673,7 @@ def run_scenario():
                 yield "INFO: Scenario generation complete\n"
                 # If this scenario produces a JSON file, automatically replay it to HEC
                 try:
-                    if scenario_id in ['finance_mfa_fatigue_scenario', 'insider_cloud_download_exfiltration']:
+                    if scenario_id in ['finance_mfa_fatigue_scenario', 'insider_cloud_download_exfiltration', 'attack_scenario_orchestrator']:
                         from os import path
                         output_dir = env.get('SCENARIO_OUTPUT_DIR', path.join(scenarios_dir, 'configs'))
                         output_file = path.join(output_dir, f'{scenario_id}.json')
@@ -493,7 +698,8 @@ def run_scenario():
                             for sline in iter(send_proc.stdout.readline, ''):
                                 if not sline:
                                     break
-                                yield sline
+                                if should_output_line(sline):
+                                    yield sline
                             send_proc.wait()
                             if send_proc.returncode == 0:
                                 yield "INFO: Scenario replay to HEC complete\n"
@@ -519,7 +725,8 @@ def run_scenario():
                                         for nline in iter(noise_proc.stdout.readline, ''):
                                             if not nline:
                                                 break
-                                            yield nline
+                                            if should_output_line(nline):
+                                                yield nline
                                         noise_proc.wait()
                                         
                                         if noise_proc.returncode == 0:
@@ -547,7 +754,8 @@ def run_scenario():
                                                     for nsline in iter(noise_send_proc.stdout.readline, ''):
                                                         if not nsline:
                                                             break
-                                                        yield nsline
+                                                        if should_output_line(nsline):
+                                                            yield nsline
                                                     noise_send_proc.wait()
                                                     if noise_send_proc.returncode == 0:
                                                         yield "\nINFO: Background noise sent to HEC successfully\n"

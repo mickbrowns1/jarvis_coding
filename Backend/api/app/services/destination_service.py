@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 
 from app.models.destination import Destination, Base
+from app.models.settings import Setting  # Import to register with Base.metadata
 from app.utils.encryption import get_encryption_instance
 from app.core.config import settings
 
@@ -50,6 +51,8 @@ class DestinationService:
         dest_type: str,
         url: Optional[str] = None,
         token: Optional[str] = None,
+        config_api_url: Optional[str] = None,
+        config_write_token: Optional[str] = None,
         ip: Optional[str] = None,
         port: Optional[int] = None,
         protocol: Optional[str] = None
@@ -62,6 +65,8 @@ class DestinationService:
             dest_type: 'hec' or 'syslog'
             url: HEC URL (for HEC destinations)
             token: HEC token (for HEC destinations, will be encrypted)
+            config_api_url: Config API URL for parser management (e.g., https://xdr.us1.sentinelone.net)
+            config_write_token: Config API token for reading and writing parsers (will be encrypted)
             ip: Syslog IP (for syslog destinations)
             port: Syslog port (for syslog destinations)
             protocol: 'UDP' or 'TCP' (for syslog destinations)
@@ -98,6 +103,10 @@ class DestinationService:
             destination.url = url
             if token:
                 destination.token_encrypted = self.encryption.encrypt(token)
+            if config_api_url:
+                destination.config_api_url = config_api_url.rstrip('/')
+            if config_write_token:
+                destination.config_write_token_encrypted = self.encryption.encrypt(config_write_token)
         elif dest_type == 'syslog':
             destination.ip = ip
             destination.port = port
@@ -135,6 +144,8 @@ class DestinationService:
         name: Optional[str] = None,
         url: Optional[str] = None,
         token: Optional[str] = None,
+        config_api_url: Optional[str] = None,
+        config_write_token: Optional[str] = None,
         ip: Optional[str] = None,
         port: Optional[int] = None,
         protocol: Optional[str] = None
@@ -152,6 +163,10 @@ class DestinationService:
                 destination.url = url
             if token:
                 destination.token_encrypted = self.encryption.encrypt(token)
+            if config_api_url:
+                destination.config_api_url = config_api_url.rstrip('/')
+            if config_write_token:
+                destination.config_write_token_encrypted = self.encryption.encrypt(config_write_token)
         elif destination.type == 'syslog':
             if ip:
                 destination.ip = ip
