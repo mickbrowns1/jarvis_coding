@@ -1,4 +1,10 @@
-# Jarvis Frontend & Backend – Docker Quickstart
+<p align="center">
+  <img src="docs/helioslogo.png" alt="HELIOS Logo" width="80" height="80">
+</p>
+
+# Welcome to HELIOS - HEC-enabled Event Log Inject & Orchestration System
+
+## HELIOS Frontend & Backend – Docker Quickstart
 
 This repository contains two services:
 - Backend API (FastAPI) under `Backend/api/`
@@ -69,7 +75,7 @@ curl http://localhost:8000
 # API health
 curl http://localhost:8000/api/v1/health
 # Open the UI in your browser
-open http://localhost:9001
+open http://localhost:9002
 ```
 
 ## Configuration (.env)
